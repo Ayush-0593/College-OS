@@ -1,0 +1,244 @@
+// College OS — Prisma schema (SQLite for v1, swappable to Postgres later)
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String
+  password  String
+  createdAt DateTime @default(now())
+  student   Student?
+  subjects  Subject[]
+  timetable TimetableEntry[]
+  exams     Exam[]
+  attendance Attendance[]
+  notices   Notice[]
+  conversations AiConversation[]
+  documents Document[]
+  chunks     DocumentChunk[]
+  notifications Notification[]
+  notificationPref NotificationPref?
+}
+
+model Student {
+  id          String   @id @default(cuid())
+  userId      String   @unique
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  course      String?  // e.g. "B.Tech CSE"
+  semester    Int      @default(3)
+  cgpa        Float?   @default(0)
+  collegeName String?
+  department  String?
+  streak      Int      @default(0)
+  createdAt   DateTime @default(now())
+}
+
+model Subject {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String
+  code      String?
+  faculty   String?
+  color     String? // hex accent for UI
+  createdAt DateTime @default(now())
+
+  timetable   TimetableEntry[]
+  assignments Assignment[]
+  exams       Exam[]
+  attendance  Attendance?
+
+  @@index([userId])
+}
+
+model TimetableEntry {
+  id        String  @id @default(cuid())
+  userId    String
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subjectId String?
+  subject   Subject? @relation(fields: [subjectId], references: [id], onDelete: SetNull)
+  day       Int // 0 = Monday ... 6 = Sunday
+  start     String // "09:00"
+  end       String // "10:00"
+  room      String?
+  type      String  @default("class") // class | break | lab
+  label     String? // label for break / custom
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model Assignment {
+  id          String   @id @default(cuid())
+  userId      String
+  subjectId   String?
+  subject     Subject? @relation(fields: [subjectId], references: [id], onDelete: SetNull)
+  title       String
+  description String?
+  professor   String?
+  dueDate     DateTime
+  priority    String   @default("medium") // high | medium | low
+  status      String   @default("not_started") // not_started | in_progress | submitted | late
+  createdAt   DateTime @default(now())
+
+  @@index([userId])
+}
+
+model Exam {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subjectId    String?
+  subject      Subject? @relation(fields: [subjectId], references: [id], onDelete: SetNull)
+  title        String
+  date         DateTime
+  time         String? // "10:00 AM"
+  syllabus     String? // newline-separated units
+  prepPercent  Int      @default(0)
+  createdAt    DateTime @default(now())
+
+  @@index([userId])
+}
+
+model Attendance {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subjectId String   @unique
+  subject   Subject? @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  total     Int      @default(0)
+  attended  Int      @default(0)
+  threshold Float    @default(75)
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model Notice {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String
+  body      String?
+  category  String   @default("Academic") // Academic | Examination | Events | Fees | Placement | Holiday | Emergency
+  source    String?
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+// §12 — "Ask My College" AI assistant
+model AiConversation {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String   // auto-derived from first user message
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  messages  AiMessage[]
+
+  @@index([userId])
+}
+
+model AiMessage {
+  id             String   @id @default(cuid())
+  conversationId String
+  conversation   AiConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           String   // "user" | "assistant"
+  content        String
+  // §27 audit trail: which intent the retrieval used, so we can show "what data the AI saw"
+  intent         String?
+  contextKeys    String?  // JSON array of retrieval slices used (e.g. ["timetable.today","assignments.dueWeek"])
+  createdAt      DateTime @default(now())
+
+  @@index([conversationId])
+}
+
+// §11 — Document Vault: student-uploaded PDFs/images (notes, PYQ, syllabus…).
+model Document {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title        String
+  originalName String
+  mimeType     String
+  sizeBytes    Int
+  category     String   @default("Notes") // Notes | PYQ | Syllabus | Marksheet | Other
+  storagePath  String   // relative to /uploads, e.g. "<userId>/<id>.pdf"
+  createdAt    DateTime @default(now())
+
+  // §21 — RAG index status. -1 = indexing failed (see indexError).
+  chunkCount   Int      @default(0)
+  indexedAt    DateTime?
+  indexError   String?
+
+  chunks       DocumentChunk[]
+
+  @@index([userId])
+}
+
+// §21 — RAG: one row per ~800-char chunk of extracted document text, with the
+// MiniLM-L6-v2 embedding (JSON-encoded number[384]) for cosine search. Brute-
+// force cosine over the user's own chunks scales to ~10K chunks/user, which
+// covers a typical semester; no vector extension required.
+model DocumentChunk {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  chunkIndex Int
+  text       String
+  // JSON-encoded number[384] (Xenova/all-MiniLM-L6-v2, mean-pooled, normalized)
+  embedding  String
+  tokens     Int      @default(0)
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+  @@index([documentId, chunkIndex])
+}
+
+// §14 — Smart Reminders
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // "class_soon" | "due_tomorrow" | "attendance_low"
+  kind      String
+  title     String
+  body      String?
+  // Deep link target, e.g. "/timetable" or "/assignments". Null = no link.
+  href      String?
+  // Stable id of the source row (assignment id, timetable entry id, subject id, …).
+  sourceId  String?
+  // `${kind}:${sourceId || ""}:${dateKey}` — unique per (userId, notifKey) so the
+  // scheduler can re-tick without spamming the user.
+  notifKey  String
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@unique([userId, notifKey])
+  @@index([userId, read, createdAt])
+  @@index([userId, createdAt])
+}
+
+model NotificationPref {
+  userId         String   @id
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  classSoon      Boolean  @default(true)
+  dueTomorrow    Boolean  @default(true)
+  attendanceLow  Boolean  @default(true)
+  examSoon       Boolean  @default(true)
+  noticeNew      Boolean  @default(true)
+  morningDigest  Boolean  @default(true)
+  eveningDigest  Boolean  @default(true)
+  updatedAt      DateTime @updatedAt
+}
